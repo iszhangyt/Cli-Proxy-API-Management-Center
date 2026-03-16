@@ -2,9 +2,12 @@ name: Mirror Upstream Releases
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
+  # NOTE: GitHub disables `schedule` triggers in forked repositories by default.
+  # To enable automatic scheduled runs, go to:
+  #   Settings → Actions → General → and make sure Actions are enabled for this repo.
+  # Additionally, if the repo was recently forked and has had no activity, GitHub may
+  # disable scheduled workflows automatically. You can re-enable them from the
+  # Actions tab by clicking "Enable workflow".
   schedule:
     - cron: '23 * * * *'
 
