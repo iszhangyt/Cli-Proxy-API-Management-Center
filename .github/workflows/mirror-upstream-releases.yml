@@ -2,6 +2,9 @@ name: Mirror Upstream Releases
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
   schedule:
     - cron: '23 * * * *'
 
