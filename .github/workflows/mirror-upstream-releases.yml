@@ -1,0 +1,214 @@
+name: Mirror Upstream Releases
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 * * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-upstream-releases
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve upstream repository info
+        id: repo
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const { data } = await github.rest.repos.get({ owner, repo });
+            const isFork = Boolean(data.fork && data.parent);
+
+            core.setOutput('is_fork', String(isFork));
+            core.setOutput('default_branch', data.default_branch || 'main');
+            if (!isFork) {
+              core.warning('Current repository is not a fork, skip release mirroring.');
+              return;
+            }
+
+            core.setOutput('upstream_full_name', data.parent.full_name);
+            core.setOutput('upstream_clone_url', data.parent.clone_url);
+
+      - name: Configure git identity
+        if: steps.repo.outputs.is_fork == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream tags
+        if: steps.repo.outputs.is_fork == 'true'
+        run: |
+          set -euo pipefail
+
+          upstream_url="${{ steps.repo.outputs.upstream_clone_url }}"
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "${upstream_url}"
+          else
+            git remote add upstream "${upstream_url}"
+          fi
+
+          git fetch upstream --tags --force
+
+      - name: Collect upstream releases
+        if: steps.repo.outputs.is_fork == 'true'
+        id: releases
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const [owner, repo] = '${{ steps.repo.outputs.upstream_full_name }}'.split('/');
+
+            const releases = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
+
+            const normalized = releases
+              .filter((release) => !release.draft)
+              .map((release) => ({
+                tag: release.tag_name,
+                name: (release.name || '').replace(/[\r\n\t]+/g, ' ').trim(),
+                url: release.html_url || '',
+                prerelease: Boolean(release.prerelease),
+                published_at: release.published_at || release.created_at || '',
+                body_b64: Buffer.from(release.body || '', 'utf8').toString('base64'),
+              }))
+              .filter((release) => Boolean(release.tag))
+              .sort((a, b) => String(a.published_at).localeCompare(String(b.published_at)));
+
+            core.info(`Detected ${normalized.length} upstream release(s) to inspect.`);
+            core.setOutput('json', JSON.stringify(normalized));
+
+      - name: Mirror tags and create releases
+        if: steps.repo.outputs.is_fork == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: ${{ steps.repo.outputs.default_branch }}
+          UPSTREAM_FULL_NAME: ${{ steps.repo.outputs.upstream_full_name }}
+          UPSTREAM_RELEASES_JSON: ${{ steps.releases.outputs.json }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${UPSTREAM_RELEASES_JSON}" ] || [ "${UPSTREAM_RELEASES_JSON}" = "[]" ]; then
+            echo "No upstream releases found."
+            exit 0
+          fi
+
+          mapfile -t release_rows < <(node -e "
+            const rows = JSON.parse(process.env.UPSTREAM_RELEASES_JSON || '[]');
+            for (const row of rows) {
+              console.log([
+                row.tag,
+                row.name || '',
+                row.prerelease ? 'true' : 'false',
+                row.body_b64 || '',
+                row.url || '',
+              ].join('\t'));
+            }
+          ")
+
+          if [ "${#release_rows[@]}" -eq 0 ]; then
+            echo "No valid upstream release records."
+            exit 0
+          fi
+
+          git fetch origin "${DEFAULT_BRANCH}" --prune
+          git checkout -B "${DEFAULT_BRANCH}" "origin/${DEFAULT_BRANCH}"
+
+          latest_mirrored_plus_tag="$(git tag --list '*-plus' --sort=-v:refname | head -n 1 || true)"
+          latest_mirrored_source_tag="${latest_mirrored_plus_tag%-plus}"
+          if [ -n "${latest_mirrored_plus_tag}" ] && [ -n "${latest_mirrored_source_tag}" ]; then
+            echo "Latest mirrored plus tag: ${latest_mirrored_plus_tag} (source: ${latest_mirrored_source_tag})"
+          else
+            echo "No existing plus tags found, will process all upstream releases."
+          fi
+
+          for row in "${release_rows[@]}"; do
+            IFS=$'\t' read -r upstream_tag upstream_name upstream_prerelease upstream_body_b64 upstream_url <<< "${row}"
+
+            if [ -z "${upstream_tag}" ]; then
+              continue
+            fi
+
+            plus_tag="${upstream_tag}-plus"
+
+            if [ -n "${latest_mirrored_source_tag}" ]; then
+              if [ "${upstream_tag}" = "${latest_mirrored_source_tag}" ] || [ "$(printf '%s\n%s\n' "${upstream_tag}" "${latest_mirrored_source_tag}" | sort -V | head -n 1)" = "${upstream_tag}" ]; then
+                echo "Skip ${upstream_tag}: not newer than baseline ${latest_mirrored_source_tag}."
+                continue
+              fi
+            fi
+
+            if ! git rev-parse -q --verify "refs/tags/${upstream_tag}" >/dev/null; then
+              echo "Skip ${upstream_tag}: upstream tag not fetched."
+              continue
+            fi
+
+            if git merge-base --is-ancestor "refs/tags/${upstream_tag}" HEAD; then
+              echo "Default branch already contains ${upstream_tag}; reuse current HEAD for ${plus_tag}."
+            else
+              git merge --no-ff --no-edit "refs/tags/${upstream_tag}"
+              git push origin "HEAD:${DEFAULT_BRANCH}"
+              echo "Merged upstream tag ${upstream_tag} into ${DEFAULT_BRANCH}."
+            fi
+
+            target_sha="$(git rev-parse HEAD || true)"
+            if [ -z "${target_sha}" ]; then
+              echo "Skip ${upstream_tag}: cannot resolve target commit."
+              continue
+            fi
+
+            if gh release view "${plus_tag}" >/dev/null 2>&1; then
+              echo "Release ${plus_tag} already exists."
+              continue
+            fi
+
+            if git rev-parse -q --verify "refs/tags/${plus_tag}" >/dev/null; then
+              echo "Tag ${plus_tag} already exists."
+            else
+              git tag "${plus_tag}" "${target_sha}"
+              git push origin "refs/tags/${plus_tag}"
+              echo "Created tag ${plus_tag} -> ${target_sha}"
+            fi
+
+            notes_file="$(mktemp)"
+            decoded_body="$(printf '%s' "${upstream_body_b64}" | base64 -d || true)"
+
+            {
+              echo "Synced from upstream release: ${UPSTREAM_FULL_NAME}@${upstream_tag}"
+              if [ -n "${upstream_url}" ]; then
+                echo "Original release: ${upstream_url}"
+              fi
+              echo
+              if [ -n "${decoded_body}" ]; then
+                echo "---"
+                echo
+                printf '%s\n' "${decoded_body}"
+              fi
+            } > "${notes_file}"
+
+            release_title="${upstream_name}"
+            if [ -z "${release_title}" ]; then
+              release_title="${upstream_tag}"
+            fi
+            release_title="${release_title} plus"
+
+            create_args=(release create "${plus_tag}" --title "${release_title}" --target "${target_sha}" --notes-file "${notes_file}")
+            if [ "${upstream_prerelease}" = "true" ]; then
+              create_args+=(--prerelease)
+            fi
+
+            gh "${create_args[@]}"
+            rm -f "${notes_file}"
+            echo "Created release ${plus_tag}."
+          done

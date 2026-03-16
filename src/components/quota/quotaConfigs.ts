@@ -1287,6 +1287,7 @@ const resolveCopilotPlanLabel = (
   const lowerPlan = plan?.toLowerCase();
   const lowerSku = sku?.toLowerCase();
 
+  if (lowerSku?.includes('educational') || lowerSku?.includes('student')) return t('copilot_quota.plan_education');
   if (lowerSku?.includes('free')) return t('copilot_quota.plan_free');
   if (lowerSku?.includes('individual')) return t('copilot_quota.plan_pro');
   if (lowerPlan === 'business' || lowerSku?.includes('business')) return t('copilot_quota.plan_business');
