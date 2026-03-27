@@ -1389,7 +1389,8 @@
     "description": "Monitor OAuth quota status for supported credentials.",
     "refresh_files": "Refresh auth files",
     "refresh_files_and_quota": "Refresh files & quota",
-    "card_idle_hint": "Use the top \"Refresh files & quota\" button to fetch the latest quota data."
+    "refresh_all_credentials": "Refresh all credentials",
+    "card_idle_hint": "Use the top \"Refresh all credentials\" button to fetch the latest quota data."
   },
   "system_info": {
     "title": "Management Center Info",
